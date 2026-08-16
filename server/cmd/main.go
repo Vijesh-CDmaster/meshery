@@ -1,572 +1,626 @@
 package main
 
 import (
-	"context"
+	"flag"
 	"fmt"
-	"net/url"
+	"log"
 	"os"
-	"os/signal"
-	"path"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"projects"
 
-	"github.com/meshery/schemas/models/core"
-
-	"github.com/fsnotify/fsnotify"
-
-	"github.com/gofrs/uuid"
-	"github.com/meshery/meshery/mesheryctl/pkg/constants"
-	"github.com/meshery/meshery/server/handlers"
-	"github.com/meshery/meshery/server/helpers"
-	"github.com/meshery/meshery/server/helpers/utils"
-	"github.com/meshery/meshery/server/internal/graphql"
-	"github.com/meshery/meshery/server/internal/store"
-	"github.com/meshery/meshery/server/machines"
-	mhelpers "github.com/meshery/meshery/server/machines/helpers"
-	"github.com/meshery/meshery/server/models"
-	"github.com/meshery/meshery/server/models/connections"
-	"github.com/meshery/meshery/server/router"
-	"github.com/meshery/meshkit/broker/nats"
-	"github.com/meshery/meshkit/logger"
-	_events "github.com/meshery/meshkit/models/events"
-	"github.com/meshery/meshkit/models/meshmodel/core/policies"
-	meshmodel "github.com/meshery/meshkit/models/meshmodel/registry"
-	"github.com/meshery/meshkit/tracing"
-	"github.com/meshery/meshkit/utils/broadcast"
-	"github.com/meshery/meshkit/utils/events"
-	meshsyncmodel "github.com/meshery/meshsync/pkg/model"
-	"github.com/meshery/schemas/models/v1beta1/environment"
-	"github.com/meshery/schemas/models/v1beta1/workspace"
-	schemasOrganization "github.com/meshery/schemas/models/v1beta2/organization"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
-var (
-	globalTokenForAnonymousResults string
-	version                        = "Not Set"
-	commitsha                      = "Not Set"
-	releasechannel                 = "Not Set"
-)
-
-const (
-	// DefaultProviderURL is the ProviderBaseURL stamped on the built-in local
-	// provider. It is used for capability/package paths only; the local
-	// provider does not authenticate against this URL. Sourced from the canonical
-	// primary provider host (install/providers.env) so it cannot drift from the
-	// PROVIDER_BASE_URLS default seeded into viper below.
-	DefaultProviderURL = models.PrimaryProviderURL
-	RelationshipsPath  = "../../models/kubernetes/"
-)
+// fieldEdit describes a single field change to apply to the landscape file.
+type fieldEdit struct {
+	key      string
+	newValue string
+	isExtra  bool // true if this field belongs under the extra: mapping
+	exists   bool // true = update existing field, false = insert new field
+}
 
 func main() {
-	if globalTokenForAnonymousResults != "" {
-		models.GlobalTokenForAnonymousResults = globalTokenForAnonymousResults
+	projectPath := flag.String("project", "", "Path to project.yaml")
+	landscapePath := flag.String("landscape", "", "Path to landscape.yml")
+	landscapeRepo := flag.String("landscape-repo", "cncf/landscape", "Target repository for the PR (e.g. cncf/landscape)")
+	createPR := flag.Bool("create-pr", false, "Create a Pull Request with the changes")
+	dryRun := flag.Bool("dry-run", false, "Print changes and PR details without executing")
+	flag.Parse()
+
+	if *projectPath == "" || *landscapePath == "" {
+		log.Fatal("Both --project and --landscape flags are required")
 	}
 
-	viper.AutomaticEnv()
-
-	// Meshery Server configuration
-	viper.SetConfigFile("./server-config.env")
-	viper.WatchConfig()
-
-	err := viper.ReadInConfig()
+	// Load Project
+	projectData, err := os.ReadFile(*projectPath)
 	if err != nil {
-		logrus.Errorf("error reading config %v", err)
+		log.Fatalf("Failed to read project file: %v", err)
+	}
+	var project projects.Project
+	if err := yaml.Unmarshal(projectData, &project); err != nil {
+		log.Fatalf("Failed to parse project YAML: %v", err)
 	}
 
-	logLevel := viper.GetInt("LOG_LEVEL")
-	if viper.GetBool("DEBUG") {
-		logLevel = int(logrus.DebugLevel)
-	}
-	logOption := logger.Options{
-		Format:   logger.SyslogLogFormat,
-		LogLevel: logLevel,
-		// if debug, output caller
-		EnableCallerInfo: logLevel == int(logrus.DebugLevel),
-	}
-	// Initialize Logger instance
-	log, err := logger.New("meshery", logOption)
+	// Load Landscape
+	landscapeData, err := os.ReadFile(*landscapePath)
 	if err != nil {
-		logrus.Error(err)
-		os.Exit(1)
+		log.Fatalf("Failed to read landscape file: %v", err)
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(landscapeData, &root); err != nil {
+		log.Fatalf("Failed to parse landscape YAML: %v", err)
 	}
 
-	viper.OnConfigChange(func(event fsnotify.Event) {
-		log.Info("received change for", event.Name)
-		log.SetLevel(logrus.Level(viper.GetInt("LOG_LEVEL")))
-	})
+	lines := strings.Split(string(landscapeData), "\n")
 
-	instanceID, err := uuid.NewV4()
-	if err != nil {
-		log.Error(ErrCreatingUUIDInstance(err))
-		os.Exit(1)
+	// Update using line-level edits
+	newLines, updated := updateLandscape(&root, &project, lines)
+	if !updated {
+		log.Printf("No matching entry found or no changes needed for project %s", project.Name)
+		os.Exit(0)
 	}
 
-	// operatingSystem, err := exec.Command("uname", "-s").Output()
-	// if err != nil {
-	// 	logrus.Error(err)
-	// }
+	output := strings.Join(newLines, "\n")
 
-	ctx := context.Background()
-
-	viper.AutomaticEnv()
-
-	viper.SetDefault("PORT", 8080)
-	viper.SetDefault("ADAPTER_URLS", "")
-	viper.SetDefault("BUILD", version)
-	viper.SetDefault("OS", "meshery")
-	viper.SetDefault("COMMITSHA", commitsha)
-	viper.SetDefault("RELEASE_CHANNEL", releasechannel)
-	viper.SetDefault("INSTANCE_ID", &instanceID)
-	viper.SetDefault(constants.ProviderENV, "")
-	// Seed the canonical active remote-provider list (install/providers.env) so a
-	// server started without PROVIDER_BASE_URLS still registers the default providers.
-	viper.SetDefault(constants.ProviderURLsENV, models.DefaultRemoteProviderURLs)
-	viper.SetDefault("REGISTER_STATIC_K8S", true)
-	viper.SetDefault("SKIP_DOWNLOAD_CONTENT", false)
-	viper.SetDefault("SKIP_DOWNLOAD_EXTENSIONS", false)
-	viper.SetDefault("SKIP_COMP_GEN", false)
-	viper.SetDefault("PLAYGROUND", false)
-	viper.SetDefault("MESHSYNC_DEFAULT_DEPLOYMENT_MODE", connections.MeshsyncDeploymentModeDefault)
-	store.Initialize()
-
-	// initialize tracing. Skip entirely when OTEL_CONFIG is unset so local dev
-	// doesn't pay for a failing OTLP gRPC exporter that logs
-	// "traces export: ... connection refused" every ~10s.
-	var tracingProvider *sdktrace.TracerProvider
-	otelConfigString := strings.TrimSpace(viper.GetString("OTEL_CONFIG"))
-	if otelConfigString == "" {
-		log.Info("OpenTelemetry config not set; tracing disabled")
-	} else {
-		log.Info("Initializing OpenTelemetry tracing with config:", otelConfigString)
-		provider, err := tracing.InitTracerFromYamlConfig(context.Background(), otelConfigString)
+	if *dryRun {
+		tmpFile, err := os.CreateTemp("", "landscape-*.yml")
 		if err != nil {
-			log.Error(fmt.Errorf("failed to initialize OpenTelemetry tracing: %v", err))
-		} else {
-			tracingProvider = provider
-			log.Info("OpenTelemetry tracing initialized with config:" + otelConfigString)
+			log.Fatalf("Failed to create temp file: %v", err)
+		}
+		defer func() {
+			if err := os.Remove(tmpFile.Name()); err != nil {
+				log.Printf("Warning: failed to remove temp file: %v", err)
+			}
+		}()
+
+		if _, err := tmpFile.WriteString(output); err != nil {
+			log.Fatalf("Failed to write temp file: %v", err)
+		}
+		if err := tmpFile.Close(); err != nil {
+			log.Fatalf("Failed to close temp file: %v", err)
+		}
+
+		cmd := exec.Command("diff", "-u", *landscapePath, tmpFile.Name())
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		fmt.Println("--- Diff ---")
+		_ = cmd.Run()
+
+		fmt.Println("\n--- Pull Request Details ---")
+		fmt.Printf("Title: Update %s metadata\n", project.Name)
+		fmt.Printf("Body: Automated update for %s from cncf/automation\n", project.Name)
+		fmt.Printf("Branch: update-%s-%d\n", strings.ReplaceAll(strings.ToLower(project.Name), " ", "-"), time.Now().Unix())
+		fmt.Printf("Target Repo: %s\n", *landscapeRepo)
+		fmt.Println("Commit will be signed off for DCO compliance")
+		return
+	}
+
+	// Save
+	if err := os.WriteFile(*landscapePath, []byte(output), 0644); err != nil {
+		log.Fatalf("Failed to write landscape file: %v", err)
+	}
+	log.Printf("Successfully updated landscape.yml for project %s", project.Name)
+
+	if *createPR {
+		if err := createPullRequest(*landscapePath, *landscapeRepo, &project); err != nil {
+			log.Fatalf("Failed to create PR: %v", err)
 		}
 	}
-	// Defer shutdown of tracer provider
-	defer func() {
-		if tracingProvider != nil {
-			if err := tracingProvider.Shutdown(context.Background()); err != nil {
-				log.Error(fmt.Errorf("failed to shutdown OpenTelemetry tracer provider: %v", err))
+}
+
+func createPullRequest(landscapePath, landscapeRepo string, project *projects.Project) error {
+	absPath, err := filepath.Abs(landscapePath)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	dir := filepath.Dir(absPath)
+	fileName := filepath.Base(absPath)
+
+	// Generate branch name
+	safeName := strings.ReplaceAll(strings.ToLower(project.Name), " ", "-")
+	branchName := fmt.Sprintf("update-%s-%d", safeName, time.Now().Unix())
+
+	log.Printf("Creating PR for branch %s in %s", branchName, dir)
+
+	// Helper to run git commands
+	runGit := func(args ...string) error {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+
+	// Create branch
+	if err := runGit("checkout", "-b", branchName); err != nil {
+		return fmt.Errorf("git checkout failed: %v", err)
+	}
+
+	// Add file
+	if err := runGit("add", fileName); err != nil {
+		return fmt.Errorf("git add failed: %v", err)
+	}
+
+	// Commit with sign-off for DCO compliance
+	msg := fmt.Sprintf("Update %s metadata", project.Name)
+	if err := runGit("commit", "-s", "-m", msg); err != nil {
+		return fmt.Errorf("git commit failed: %v", err)
+	}
+
+	// Push
+	if err := runGit("push", "origin", branchName); err != nil {
+		return fmt.Errorf("git push failed: %v", err)
+	}
+
+	// Create PR using gh
+	if _, err := exec.LookPath("gh"); err != nil {
+		return fmt.Errorf("gh cli not found, cannot create PR")
+	}
+
+	prBody := fmt.Sprintf("Automated update for %s from cncf/automation", project.Name)
+	cmd := exec.Command("gh", "pr", "create", "--title", msg, "--body", prBody, "--head", branchName, "--repo", landscapeRepo)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("gh pr create failed: %v", err)
+	}
+
+	return nil
+}
+
+// updateLandscape navigates the YAML node tree to find the matching project
+// entry, then applies line-level edits to the raw file lines.
+func updateLandscape(root *yaml.Node, project *projects.Project, lines []string) ([]string, bool) {
+	if root.Kind != yaml.DocumentNode {
+		return lines, false
+	}
+
+	var landscapeSeq *yaml.Node
+	if len(root.Content) > 0 && root.Content[0].Kind == yaml.MappingNode {
+		for i := 0; i < len(root.Content[0].Content); i += 2 {
+			key := root.Content[0].Content[i]
+			val := root.Content[0].Content[i+1]
+			if key.Value == "landscape" && val.Kind == yaml.SequenceNode {
+				landscapeSeq = val
+				break
 			}
 		}
-	}()
+	}
 
-	log.Info("Local Provider capabilities are: ", version)
+	if landscapeSeq == nil {
+		return lines, false
+	}
 
-	// Get the channel
-	log.Info("Meshery Server release channel is: ", releasechannel)
-
-	log.Infof("MESHSYNC_DEFAULT_DEPLOYMENT_MODE is %s", viper.GetString("MESHSYNC_DEFAULT_DEPLOYMENT_MODE"))
-
-	home, err := os.UserHomeDir()
-	if viper.GetString("USER_DATA_FOLDER") == "" {
-		if err != nil {
-			log.Error(ErrRetrievingUserHomeDirectory(err))
-			os.Exit(1)
+	for _, categoryNode := range landscapeSeq.Content {
+		var subcategoriesSeq *yaml.Node
+		for i := 0; i < len(categoryNode.Content); i += 2 {
+			key := categoryNode.Content[i]
+			val := categoryNode.Content[i+1]
+			if key.Value == "subcategories" && val.Kind == yaml.SequenceNode {
+				subcategoriesSeq = val
+				break
+			}
 		}
-		viper.SetDefault("USER_DATA_FOLDER", path.Join(home, ".meshery", "config"))
-	}
-
-	errDir := os.MkdirAll(viper.GetString("USER_DATA_FOLDER"), 0755)
-	if errDir != nil {
-		log.Error(ErrCreatingUserDataDirectory(viper.GetString("USER_DATA_FOLDER")))
-		os.Exit(1)
-	}
-	logDir := path.Join(home, ".meshery", "logs", "registry")
-	errDir = os.MkdirAll(logDir, 0755)
-	if errDir != nil {
-		logrus.Fatalf("Error creating user data directory: %v", err)
-	}
-
-	// Create or open the log file
-	logFilePath := path.Join(logDir, "registry-logs.log")
-	logFile, err := os.Create(logFilePath)
-	if err != nil {
-		logrus.Fatalf("Could not create log file: %v", err)
-	}
-	defer func() {
-		if err := logFile.Close(); err != nil {
-			log.Error(err)
-		}
-	}()
-	viper.Set("REGISTRY_LOG_FILE", logFilePath)
-
-	log.Info("Meshery Database is at: ", viper.GetString("USER_DATA_FOLDER"))
-	if viper.GetString("KUBECONFIG_FOLDER") == "" {
-		if err != nil {
-			log.Error(ErrRetrievingUserHomeDirectory(err))
-			os.Exit(1)
-		}
-		viper.SetDefault("KUBECONFIG_FOLDER", path.Join(home, ".kube"))
-	}
-	log.Info("Using kubeconfig at: ", viper.GetString("KUBECONFIG_FOLDER"))
-	log.Info("Log level: ", log.GetLevel())
-
-	adapterURLs := utils.SplitAndTrim(viper.GetString("ADAPTER_URLS"), ", \t\n\r")
-
-	adapterTracker := helpers.NewAdaptersTracker(adapterURLs)
-
-	// Uncomment line below to generate a new UUID and force the user to login every time Meshery is started.
-	// fileSessionStore := sessions.NewFilesystemStore("", []byte(uuid.NewV4().Bytes()))
-	// fileSessionStore := sessions.NewFilesystemStore("", []byte("Meshery"))
-	// fileSessionStore.MaxLength(0)
-
-	provs := map[string]models.Provider{}
-
-	preferencePersister, err := models.NewMapPreferencePersister()
-	if err != nil {
-		log.Error(ErrCreatingMapPreferencePersisterInstance(err))
-		os.Exit(1)
-	}
-	defer preferencePersister.ClosePersister()
-
-	dbHandler := models.GetNewDBInstance()
-	regManager, err := meshmodel.NewRegistryManager(dbHandler)
-	if err != nil {
-		log.Error(ErrInitializingRegistryManager(err))
-		os.Exit(1)
-	}
-	meshsyncCh := make(chan struct{}, 10)
-	brokerConn := nats.NewEmptyConnection
-
-	err = dbHandler.AutoMigrate(
-		&meshsyncmodel.KubernetesKeyValue{},
-		&meshsyncmodel.KubernetesResource{},
-		&meshsyncmodel.KubernetesResourceSpec{},
-		&meshsyncmodel.KubernetesResourceStatus{},
-		&meshsyncmodel.KubernetesResourceObjectMeta{},
-		&models.PerformanceProfile{},
-		&models.MesheryResult{},
-		&models.MesheryPattern{},
-		&models.MesheryFilter{},
-		&models.PatternResource{},
-		&models.MesheryApplication{},
-		&models.UserPreference{},
-		&models.UserCapabilities{},
-		&models.PerformanceTestConfig{},
-		&models.SmiResultWithID{},
-		models.K8sContext{},
-		schemasOrganization.Organization{},
-		models.Key{},
-		&models.Credential{},
-		connections.Connection{},
-		environment.Environment{},
-		environment.EnvironmentConnectionMapping{},
-		workspace.Workspace{},
-		workspace.WorkspacesEnvironmentsMapping{},
-		workspace.WorkspacesDesignsMapping{},
-		workspace.WorkspacesTeamsMapping{},
-		workspace.WorkspacesViewsMapping{},
-		_events.Event{},
-		&models.SystemSetting{},
-	)
-	if err != nil {
-		log.Error(ErrDatabaseAutoMigration(err))
-		os.Exit(1)
-	}
-
-	meshsyncDefaultDeploymentMode := connections.MeshsyncDeploymentModeFromString(
-		viper.GetString("MESHSYNC_DEFAULT_DEPLOYMENT_MODE"),
-	)
-
-	if meshsyncDefaultDeploymentMode == connections.MeshsyncDeploymentModeUndefined {
-		meshsyncDefaultDeploymentMode = connections.MeshsyncDeploymentModeDefault
-	}
-
-	lProv := &models.DefaultLocalProvider{
-		ProviderBaseURL:                 DefaultProviderURL,
-		MapPreferencePersister:          preferencePersister,
-		UserCapabilitiesPersister:       &models.UserCapabilitiesPersister{DB: dbHandler},
-		ResultPersister:                 &models.MesheryResultsPersister{DB: dbHandler},
-		SmiResultPersister:              &models.SMIResultsPersister{DB: dbHandler},
-		TestProfilesPersister:           &models.TestProfilesPersister{DB: dbHandler},
-		PerformanceProfilesPersister:    &models.PerformanceProfilePersister{DB: dbHandler},
-		MesheryPatternPersister:         &models.MesheryPatternPersister{DB: dbHandler},
-		MesheryFilterPersister:          &models.MesheryFilterPersister{DB: dbHandler},
-		MesheryApplicationPersister:     &models.MesheryApplicationPersister{DB: dbHandler},
-		MesheryPatternResourcePersister: &models.PatternResourcePersister{DB: dbHandler},
-		MesheryK8sContextPersister:      &models.MesheryK8sContextPersister{DB: dbHandler},
-		OrganizationPersister:           &models.OrganizationPersister{DB: dbHandler},
-		ConnectionPersister:             &models.ConnectionPersister{DB: dbHandler},
-		EnvironmentPersister:            &models.EnvironmentPersister{DB: dbHandler},
-		WorkspacePersister:              &models.WorkspacePersister{DB: dbHandler},
-		KeyPersister:                    &models.KeyPersister{DB: dbHandler},
-		EventsPersister:                 &models.EventsPersister{DB: dbHandler},
-		GenericPersister:                dbHandler,
-		Log:                             log,
-		MeshsyncDefaultDeploymentMode:   meshsyncDefaultDeploymentMode,
-	}
-
-	// Local remote provider is initalized here.
-	lProv.Initialize()
-
-	hc := &models.HandlerConfig{
-		Providers:              provs,
-		ProviderCookieName:     "meshery-provider",
-		ProviderCookieDuration: 30 * 24 * time.Hour,
-		// ProviderTracker is set below, once provider registration is
-		// complete and the tracker has been built around the final
-		// `provs` map. The handlers must not access it before that
-		// assignment, but every route is registered after.
-		PlaygroundBuild: viper.GetBool("PLAYGROUND"),
-		AdapterTracker:  adapterTracker,
-
-		KubeConfigFolder: viper.GetString("KUBECONFIG_FOLDER"),
-
-		EventBroadcaster: models.NewBroadcaster("Events"),
-
-		K8scontextChannel: models.NewContextHelper(),
-		OperatorTracker:   models.NewOperatorTracker(viper.GetBool("DISABLE_OPERATOR")),
-	}
-	krh, err := models.NewKeysRegistrationHelper(dbHandler, log)
-	if err != nil {
-		log.Error(ErrInitializingKeysRegistration(err))
-		os.Exit(1)
-	}
-	//seed the local meshmodel components
-	rego := policies.Rego{}
-
-	go func() {
-		// This is where models are seeded from meshmodel directory to registry
-		models.SeedComponents(log, hc, regManager)
-		// Rego is intialized for passing of policy if the policies are made to be per model base this needs to be removed.
-		r, err := policies.NewRegoInstance(models.PoliciesPath, regManager)
-		if err != nil {
-			log.Warn(handlers.ErrCreatingOPAInstance(err))
-		} else {
-			rego = *r
-		}
-		krh.SeedKeys(viper.GetString("KEYS_PATH"))
-	}()
-
-	lProv.SeedContent(log)
-	provs[lProv.Name()] = lProv
-
-	providerEnvVar := viper.GetString(constants.ProviderENV)
-	RemoteProviderURLs := utils.SplitAndTrim(viper.GetString("PROVIDER_BASE_URLS"), ", \t\n\r")
-	for _, providerurl := range RemoteProviderURLs {
-		parsedURL, err := url.Parse(providerurl)
-		if err != nil {
-			log.Error(ErrInvalidURLSkippingProvider(providerurl))
+		if subcategoriesSeq == nil {
 			continue
 		}
-		cp := &models.RemoteProvider{
-			RemoteProviderURL:             parsedURL.String(),
-			RefCookieName:                 parsedURL.Host + "_ref",
-			SessionName:                   parsedURL.Host,
-			TokenStore:                    make(map[string]string),
-			LoginCookieDuration:           1 * time.Hour,
-			SessionPreferencePersister:    &models.SessionPreferencePersister{DB: dbHandler},
-			UserCapabilitiesPersister:     &models.UserCapabilitiesPersister{DB: dbHandler},
-			ProviderVersion:               version,
-			SmiResultPersister:            &models.SMIResultsPersister{DB: dbHandler},
-			GenericPersister:              dbHandler,
-			EventsPersister:               &models.EventsPersister{DB: dbHandler},
-			Log:                           log,
-			CookieDuration:                24 * time.Hour,
-			MeshsyncDefaultDeploymentMode: meshsyncDefaultDeploymentMode,
-		}
 
-		// Initialize stamps the minimum addressable metadata
-		// (ProviderType, ProviderURL, fallback ProviderName=host) so the
-		// provider is renderable in /api/providers immediately. The
-		// capabilities HTTP probe runs later, concurrently, via
-		// ProviderTracker.VerifyAll - a single unreachable remote can no
-		// longer block server startup or the provider chooser.
-		cp.Initialize()
-
-		// Pick a registration key that survives two failure modes:
-		//   1. /capabilities has not been probed yet (or will fail at
-		//      probe time), so cp.Name() is the URL host fallback that
-		//      Initialize stamps. Two remotes sharing the same host
-		//      would collide - the parsed URL keeps each addressable.
-		//   2. Two configured URLs report the SAME canonical name from
-		//      /capabilities once the probe lands (for example, both
-		//      cloud.meshery.io and cloud.acme.io currently return
-		//      "Meshery"). Since we now key by the host-fallback name
-		//      before the probe, the name collision shows up later, in
-		//      VerifyAll; but at registration time we already disambiguate
-		//      by URL host so both entries reach the tracker.
-		// On collision (same host or same fallback name) we re-key the
-		// earlier entry by its URL host and let the new entry claim the
-		// canonical name. This preserves the historical "last URL wins
-		// the canonical name" routing that integrations rely on (e.g.
-		// tokens minted against cloud.acme.io expect the cookie value
-		// "Meshery" to resolve to cloud.acme.io regardless of the
-		// iteration order of PROVIDER_BASE_URLS), while still giving the
-		// re-keyed provider an addressable home in /api/providers.
-		key := cp.Name()
-		if key == "" {
-			key = parsedURL.Host
-			log.Warnf("remote provider at %q produced an empty Name() after Initialize; registering it under host %q so it remains addressable.", providerurl, key)
-		}
-		if existing, ok := provs[key]; ok {
-			existingHost := existing.GetProviderURL()
-			if u, err := url.Parse(existingHost); err == nil && u.Host != "" {
-				existingHost = u.Host
+		for _, subcategoryNode := range subcategoriesSeq.Content {
+			var itemsSeq *yaml.Node
+			for i := 0; i < len(subcategoryNode.Content); i += 2 {
+				key := subcategoryNode.Content[i]
+				val := subcategoryNode.Content[i+1]
+				if key.Value == "items" && val.Kind == yaml.SequenceNode {
+					itemsSeq = val
+					break
+				}
 			}
-			log.Warnf("provider name collision: %q is already registered for %q; re-keying the earlier entry as %q so both remain addressable, and giving the canonical name %q to %q. Ensure each remote provider's /capabilities returns a unique providerName.", key, existing.GetProviderURL(), existingHost, key, providerurl)
-			provs[existingHost] = existing
-			delete(provs, key)
-		}
-		provs[key] = cp
-	}
-
-	// All providers are registered. Build the tracker now and kick off
-	// the boot-time availability probe + post-probe SyncPreferences
-	// activation in a background goroutine, so a slow remote cannot
-	// delay server startup. The probe publishes status events as each
-	// remote settles, so the chooser shows the local provider (and any
-	// already-reachable remotes) immediately and updates each remote
-	// entry independently as its probe completes.
-	providerTracker := models.NewProviderTracker(provs, log)
-	hc.ProviderTracker = providerTracker
-	go func() {
-		providerTracker.VerifyAll(ctx)
-		// SyncPreferences requires capabilities to have been loaded
-		// (the SyncPrefs entry is what tells the goroutine the remote
-		// accepts preference sync). Activate it AFTER the boot probe
-		// so the in-loop call doesn't no-op on still-empty caps.
-		for _, p := range provs {
-			rp, ok := p.(*models.RemoteProvider)
-			if !ok {
+			if itemsSeq == nil {
 				continue
 			}
-			rp.SyncPreferences()
-		}
-	}()
 
-	// Defer StopSyncPreferences for every remote, regardless of whether
-	// SyncPreferences ever started. The Stop call is internally guarded
-	// so it is a safe no-op when sync was never activated (probe failed,
-	// shutdown ran before activation, or the remote does not advertise
-	// SyncPrefs).
-	for _, p := range provs {
-		rp, ok := p.(*models.RemoteProvider)
-		if !ok {
+			for _, itemNode := range itemsSeq.Content {
+				newLines, matched := matchAndUpdateItem(itemNode, project, lines)
+				if matched {
+					return newLines, true
+				}
+			}
+		}
+	}
+
+	return lines, false
+}
+
+// matchAndUpdateItem checks if the given item node matches the project (by name
+// and repo_url), and if so, detects changes and applies line-level edits.
+func matchAndUpdateItem(itemNode *yaml.Node, project *projects.Project, lines []string) ([]string, bool) {
+	var nameNode *yaml.Node
+	var repoURLNode *yaml.Node
+
+	for i := 0; i < len(itemNode.Content); i += 2 {
+		key := itemNode.Content[i]
+		val := itemNode.Content[i+1]
+		if key.Value == "name" {
+			nameNode = val
+		} else if key.Value == "repo_url" {
+			repoURLNode = val
+		}
+	}
+
+	if nameNode == nil || repoURLNode == nil {
+		return lines, false
+	}
+
+	nameMatch := strings.EqualFold(nameNode.Value, project.Name)
+	repoMatch := false
+	for _, repo := range project.Repositories {
+		if strings.EqualFold(repoURLNode.Value, repo.URL) {
+			repoMatch = true
+			break
+		}
+	}
+
+	if !nameMatch || !repoMatch {
+		return lines, false
+	}
+
+	edits := detectChanges(itemNode, project)
+	if len(edits) == 0 {
+		return lines, false
+	}
+
+	newLines := applyItemEdits(lines, edits, itemNode)
+	return newLines, true
+}
+
+// detectChanges compares the YAML node tree values against the project and
+// returns a list of field edits needed. This is read-only on the node tree.
+func detectChanges(itemNode *yaml.Node, project *projects.Project) []fieldEdit {
+	var edits []fieldEdit
+
+	checkField := func(key, newValue string, isExtra bool, node *yaml.Node) {
+		if newValue == "" {
+			return
+		}
+		found := false
+		for i := 0; i < len(node.Content); i += 2 {
+			if node.Content[i].Value == key {
+				found = true
+				if node.Content[i+1].Value != newValue {
+					edits = append(edits, fieldEdit{key: key, newValue: newValue, isExtra: isExtra, exists: true})
+				}
+				break
+			}
+		}
+		if !found {
+			edits = append(edits, fieldEdit{key: key, newValue: newValue, isExtra: isExtra, exists: false})
+		}
+	}
+
+	// Top-level fields
+	checkField("homepage_url", project.Website, false, itemNode)
+	checkField("description", project.Description, false, itemNode)
+
+	if val, ok := project.Social["twitter"]; ok {
+		checkField("twitter", val, false, itemNode)
+	}
+
+	// Extra fields
+	extraMappings := map[string]string{
+		"slack":    "slack_url",
+		"linkedin": "linkedin_url",
+		"youtube":  "youtube_url",
+	}
+
+	needsExtra := false
+	for key := range extraMappings {
+		if _, ok := project.Social[key]; ok {
+			needsExtra = true
+			break
+		}
+	}
+
+	if needsExtra {
+		var extraNode *yaml.Node
+		for i := 0; i < len(itemNode.Content); i += 2 {
+			if itemNode.Content[i].Value == "extra" {
+				extraNode = itemNode.Content[i+1]
+				break
+			}
+		}
+
+		for socialKey, landscapeKey := range extraMappings {
+			val, ok := project.Social[socialKey]
+			if !ok || val == "" {
+				continue
+			}
+			if extraNode != nil {
+				checkField(landscapeKey, val, true, extraNode)
+			} else {
+				edits = append(edits, fieldEdit{key: landscapeKey, newValue: val, isExtra: true, exists: false})
+			}
+		}
+	}
+
+	return edits
+}
+
+// applyItemEdits applies the detected field edits to the raw file lines.
+// Updates are applied first (they may shrink lines by collapsing block scalars),
+// then inserts are applied (they grow lines).
+func applyItemEdits(lines []string, edits []fieldEdit, itemNode *yaml.Node) []string {
+	result := make([]string, len(lines))
+	copy(result, lines)
+
+	start, end := getItemLineRange(result, itemNode)
+	fieldIndent := detectFieldIndent(result, start, end)
+	extraIndent := fieldIndent + 2
+
+	// Apply updates first (may change line count if collapsing block scalars)
+	for _, edit := range edits {
+		if !edit.exists {
 			continue
 		}
-		defer rp.StopSyncPreferences()
+		indent := fieldIndent
+		if edit.isExtra {
+			indent = extraIndent
+		}
+		result, end = replaceFieldInLines(result, start, end, edit.key, edit.newValue, indent)
 	}
 
-	// Resolve the configured PROVIDER to Meshery's internal registration key.
-	// Remote providers are registered under a stable key (typically URL host)
-	// before their async /capabilities probe reveals the canonical
-	// providerName, so a pre-selected remote such as PROVIDER=Meshery may need
-	// one bounded probe here to avoid falling back to the chooser.
-	resolveStart := time.Now()
-	resolvedProviderKey, providerResolved := models.ResolveProviderKeyWithProbe(ctx, providerEnvVar, provs)
-	if probeElapsed := time.Since(resolveStart); providerEnvVar != "" && probeElapsed > time.Second {
-		// Surface the boot-time remote /capabilities probe so operators can
-		// see why startup paused (each parallel probe waits up to 15s on an
-		// unreachable configured remote before timing out).
-		log.Infof("resolving configured PROVIDER %q required a remote capability probe that took %s", providerEnvVar, probeElapsed.Round(time.Millisecond))
+	// Apply inserts (each insert shifts subsequent lines)
+	for _, edit := range edits {
+		if edit.exists {
+			continue
+		}
+		indent := fieldIndent
+		if edit.isExtra {
+			indent = extraIndent
+		}
+		result, end = insertFieldInLines(result, start, end, edit.key, edit.newValue, indent, edit.isExtra, fieldIndent)
 	}
-	if providerResolved {
-		providerEnvVar = resolvedProviderKey
+
+	return result
+}
+
+// isBlankLine reports whether the given line is empty or contains only
+// whitespace, tolerating a trailing "\r" left over from CRLF-encoded files.
+// All range/indent-scanning helpers below use this so blank-line handling
+// is consistent regardless of line-ending style.
+func isBlankLine(line string) bool {
+	trimmed := strings.TrimLeft(line, " ")
+	trimmed = strings.TrimRight(trimmed, "\r")
+	return trimmed == ""
+}
+
+// getItemLineRange returns the 0-indexed start and end (exclusive) line indices
+// for the given item node within the lines slice.
+func getItemLineRange(lines []string, itemNode *yaml.Node) (start, end int) {
+	start = itemNode.Line - 1 // convert 1-indexed to 0-indexed
+
+	// Detect the indent of the "- " sequence marker on the start line
+	dashPos := strings.Index(lines[start], "- ")
+	if dashPos < 0 {
+		dashPos = 0
+	}
+
+	for i := start + 1; i < len(lines); i++ {
+		if isBlankLine(lines[i]) {
+			continue
+		}
+		trimmed := strings.TrimLeft(lines[i], " ")
+		indent := len(lines[i]) - len(trimmed)
+		if indent <= dashPos {
+			return start, i
+		}
+	}
+	return start, len(lines)
+}
+
+// detectFieldIndent determines the indentation level for top-level fields
+// within an item by examining the lines after the sequence marker line.
+func detectFieldIndent(lines []string, start, end int) int {
+	for i := start + 1; i < end && i < len(lines); i++ {
+		if isBlankLine(lines[i]) {
+			continue
+		}
+		trimmed := strings.TrimLeft(lines[i], " ")
+		return len(lines[i]) - len(trimmed)
+	}
+	// Fallback: start line indent + 2
+	trimmed := strings.TrimLeft(lines[start], " ")
+	return len(lines[start]) - len(trimmed) + 2
+}
+
+// findFieldLine returns the 0-indexed line number where the given key appears
+// at the specified indentation, or -1 if not found.
+func findFieldLine(lines []string, start, end int, key string, indent int) int {
+	prefix := strings.Repeat(" ", indent) + key + ":"
+	for i := start; i < end && i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], prefix) {
+			rest := lines[i][len(prefix):]
+			if rest == "" || rest[0] == ' ' || rest[0] == '\r' || rest[0] == '\n' {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// findExtraBlockEnd returns the line index (exclusive) where the extra block
+// ends. It scans from after the extra: key line for lines indented at or beyond
+// extraIndent.
+func findExtraBlockEnd(lines []string, extraKeyLine, itemEnd, extraIndent int) int {
+	last := extraKeyLine
+	for i := extraKeyLine + 1; i < itemEnd && i < len(lines); i++ {
+		if isBlankLine(lines[i]) {
+			continue
+		}
+		trimmed := strings.TrimLeft(lines[i], " ")
+		lineIndent := len(lines[i]) - len(trimmed)
+		if lineIndent >= extraIndent {
+			last = i
+		} else {
+			break
+		}
+	}
+	return last + 1
+}
+
+// findLastFieldLine returns the index of the last non-blank line within the
+// item that has indentation >= fieldIndent.
+func findLastFieldLine(lines []string, start, end, fieldIndent int) int {
+	last := start
+	for i := start; i < end && i < len(lines); i++ {
+		if isBlankLine(lines[i]) {
+			continue
+		}
+		trimmed := strings.TrimLeft(lines[i], " ")
+		lineIndent := len(lines[i]) - len(trimmed)
+		if lineIndent >= fieldIndent {
+			last = i
+		}
+	}
+	return last
+}
+
+// replaceFieldInLines replaces the value of an existing field in the raw lines.
+// Handles block scalars (>-, >, |, |-) by collapsing continuation lines.
+func replaceFieldInLines(lines []string, start, end int, key, newValue string, indent int) ([]string, int) {
+	lineIdx := findFieldLine(lines, start, end, key, indent)
+	if lineIdx < 0 {
+		return lines, end
+	}
+
+	prefix := strings.Repeat(" ", indent) + key + ":"
+	valuePart := strings.TrimSpace(lines[lineIdx][len(prefix):])
+
+	isBlockScalar := valuePart == ">" || valuePart == ">-" || valuePart == "|" || valuePart == "|-"
+
+	// Replace the key line with the new simple scalar value
+	lines[lineIdx] = strings.Repeat(" ", indent) + key + ": " + yamlQuoteIfNeeded(newValue)
+
+	if isBlockScalar {
+		// Remove continuation lines (lines indented more than the key)
+		contStart := lineIdx + 1
+		contEnd := contStart
+		for contEnd < end && contEnd < len(lines) {
+			trimmed := strings.TrimLeft(lines[contEnd], " ")
+			if trimmed == "" {
+				break
+			}
+			lineIndent := len(lines[contEnd]) - len(trimmed)
+			if lineIndent > indent {
+				contEnd++
+			} else {
+				break
+			}
+		}
+		if contEnd > contStart {
+			lines = append(lines[:contStart], lines[contEnd:]...)
+			end -= (contEnd - contStart)
+		}
+	}
+
+	return lines, end
+}
+
+// insertFieldInLines inserts a new field line at the appropriate position.
+// For top-level fields, inserts before extra: (if present) or at end of item.
+// For extra fields, inserts at end of extra block, creating extra: if needed.
+func insertFieldInLines(lines []string, start, end int, key, newValue string, indent int, isExtra bool, fieldIndent int) ([]string, int) {
+	newLine := strings.Repeat(" ", indent) + key + ": " + yamlQuoteIfNeeded(newValue)
+
+	var insertAt int
+
+	if isExtra {
+		extraLine := findFieldLine(lines, start, end, "extra", fieldIndent)
+		if extraLine >= 0 {
+			insertAt = findExtraBlockEnd(lines, extraLine, end, fieldIndent+2)
+		} else {
+			// Create extra: block
+			extraKeyLine := strings.Repeat(" ", fieldIndent) + "extra:"
+			insertPos := findLastFieldLine(lines, start, end, fieldIndent) + 1
+			lines = insertLine(lines, insertPos, extraKeyLine)
+			end++
+			insertAt = insertPos + 1
+		}
 	} else {
-		if providerEnvVar != "" {
-			// Informational, not an error: a configured PROVIDER that
-			// matches no registered provider is a valid fallback to the
-			// chooser, but operators should be able to see why auto-select
-			// did not engage.
-			log.Infof("configured PROVIDER %q could not be resolved to any registered provider; falling back to the provider chooser", providerEnvVar)
-		}
-		providerEnvVar = ""
-	}
-
-	operatorDeploymentConfig := models.NewOperatorDeploymentConfig(adapterTracker)
-	// this mctrlHelper is not used it is being recreated per connection entity
-	mctrlHelper := models.NewMesheryControllersHelper(
-		log,
-		operatorDeploymentConfig,
-		dbHandler,
-		hc.EventBroadcaster,
-		nil,
-		&instanceID,
-	)
-	connToInstanceTracker := machines.ConnectionToStateMachineInstanceTracker{
-		ConnectToInstanceMap: make(map[core.Uuid]*machines.StateMachine, 0),
-	}
-
-	k8sComponentsRegistrationHelper := models.NewComponentsRegistrationHelper(log)
-
-	models.InitMeshSyncRegistrationQueue()
-	mhelpers.InitRegistrationHelperSingleton(dbHandler, log, &connToInstanceTracker, hc.EventBroadcaster)
-	policies.SyncRelationship.Lock()
-	h := handlers.NewHandlerInstance(hc, meshsyncCh, log, brokerConn, k8sComponentsRegistrationHelper, mctrlHelper, dbHandler, events.NewEventStreamer(), regManager, providerEnvVar, &rego, &connToInstanceTracker, meshsyncDefaultDeploymentMode)
-	policies.SyncRelationship.Unlock()
-
-	b := broadcast.NewBroadcaster(100)
-	defer func() {
-		if err := b.Close(); err != nil {
-			log.Error(err)
-		}
-	}()
-
-	g := graphql.New(graphql.Options{
-		Config:      hc,
-		Logger:      log,
-		BrokerConn:  brokerConn,
-		Broadcaster: b,
-	})
-
-	gp := graphql.NewPlayground(graphql.Options{
-		URL: "/api/system/graphql/query",
-	})
-
-	port := viper.GetInt("PORT")
-	r := router.NewRouter(ctx, h, port, g, gp)
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-
-	go func() {
-		log.Info("Meshery Server listening on: ", port)
-		if err := r.Run(); err != nil {
-			log.Error(ErrListenAndServe(err))
-			os.Exit(1)
-		}
-	}()
-	<-c
-	regManager.Cleanup()
-	log.Info("Doing seeded content cleanup...")
-
-	for _, p := range hc.Providers {
-		// Skip the local provider: it does not register a remote session, so
-		// there is nothing to de-register or log out on shutdown.
-		if p.Name() != models.LocalProviderName {
-			log.Info("De-registering Meshery server.")
-			if err = p.DeleteMesheryConnection(); err != nil {
-				log.Error(err)
-				continue
-			}
-			// Logout follows deregistration so the session that authorized
-			// the delete is revoked only after the connection is removed.
-			log.Info("Logging out Meshery server session.")
-			if err = p.LogoutMesheryServer(); err != nil {
-				log.Error(err)
-			}
+		extraLine := findFieldLine(lines, start, end, "extra", fieldIndent)
+		if extraLine >= 0 {
+			insertAt = extraLine
+		} else {
+			insertAt = findLastFieldLine(lines, start, end, fieldIndent) + 1
 		}
 	}
 
-	err = lProv.Cleanup()
-	if err != nil {
-		log.Error(ErrCleaningUpLocalProvider(err))
-	}
-	utils.DeleteSVGsFromFileSystem()
-	log.Info("Closing database instance...")
-	err = dbHandler.DBClose()
-	if err != nil {
-		log.Error(ErrClosingDatabaseInstance(err))
+	lines = insertLine(lines, insertAt, newLine)
+	end++
+
+	return lines, end
+}
+
+// insertLine inserts a new line at the given position in the slice.
+func insertLine(lines []string, at int, line string) []string {
+	lines = append(lines, "")
+	copy(lines[at+1:], lines[at:])
+	lines[at] = line
+	return lines
+}
+
+// yamlQuoteIfNeeded returns the value with YAML quoting applied if the value
+// contains characters or has a form that would otherwise be parsed as
+// something other than a plain string scalar.
+func yamlQuoteIfNeeded(value string) string {
+	if value == "" {
+		return "''"
 	}
 
-	log.Info("Shutting down Meshery Server...")
+	needsQuoting := false
+
+	// Colon-space or space-hash anywhere mid-string starts a mapping value
+	// or a comment respectively.
+	if strings.Contains(value, ": ") || strings.Contains(value, " #") {
+		needsQuoting = true
+	}
+
+	// A colon or " #" at the very end of the value is equally significant,
+	// since it is adjacent to the line break.
+	if strings.HasSuffix(value, ":") || strings.HasSuffix(value, " #") {
+		needsQuoting = true
+	}
+
+	// Characters that are special when they are the FIRST character of a
+	// plain scalar. "#" is included here: a value starting with "#" (e.g.
+	// a description beginning "#1 open source project...") would otherwise
+	// be parsed as a comment and silently drop the rest of the line.
+	specialStarts := "&*!|>'\"%@`{}[],?#"
+	if strings.ContainsAny(string(value[0]), specialStarts) {
+		needsQuoting = true
+	}
+
+	// "- " (or a bare "-") at the start is the block sequence indicator.
+	if value == "-" || strings.HasPrefix(value, "- ") {
+		needsQuoting = true
+	}
+
+	// Words YAML parses as booleans/null rather than literal strings.
+	switch strings.ToLower(value) {
+	case "true", "false", "yes", "no", "on", "off", "null", "~":
+		needsQuoting = true
+	}
+
+	if !needsQuoting {
+		return value
+	}
+
+	escaped := strings.ReplaceAll(value, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `"` + escaped + `"`
 }
